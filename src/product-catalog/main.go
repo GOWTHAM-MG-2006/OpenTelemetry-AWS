@@ -43,7 +43,37 @@ type productCatalog struct {
 var (
 	logger *slog.Logger
 	db     *sql.DB
+	// dbAvailable is true only after a successful PingContext. Handlers
+	// check it to decide between normal serving and loud 503 degradation.
+	dbAvailable atomic.Bool
 )
+
+// Bounded retry policy for the background reconnect loop: retries are
+// spaced with exponential backoff and stop after maxDatabaseRetries, so a
+// permanently-dead DB never becomes a hot loop. Recorded here per contract.
+const (
+	maxDatabaseRetries = 10
+	baseRetryBackoff   = 2 * time.Second
+	maxRetryBackoff    = 30 * time.Second
+	// dbPingTimeout bounds the startup liveness probe.
+	dbPingTimeout = 5 * time.Second
+)
+
+// sanitizeDBError returns a log-safe description of a DB error.
+// It NEVER includes the connection string or embedded credentials:
+// any URI userinfo (user:password@) a driver may echo back is redacted.
+func sanitizeDBError(err error) string {
+	if err == nil {
+		return "unknown error"
+	}
+	msg := err.Error()
+	if i := strings.Index(msg, "://"); i >= 0 {
+		if j := strings.Index(msg[i+3:], "@"); j >= 0 {
+			msg = msg[:i+3] + "***@" + msg[i+3+j+1:]
+		}
+	}
+	return msg
+}
 
 func init() {
 	logger = slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -58,25 +88,55 @@ func initDatabase() error {
 	var err error
 	db, err = sql.Open("postgres", connStr)
 	if err != nil {
+		db = nil
 		return fmt.Errorf("failed to open database connection: %w", err)
 	}
 
-	// Test the connection
-	if err := db.Ping(); err != nil {
+	// Bounded liveness probe so boot never hangs on an unreachable DB.
+	ctx, cancel := context.WithTimeout(context.Background(), dbPingTimeout)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		db = nil
 		return fmt.Errorf("failed to ping database: %w", err)
 	}
 
+	dbAvailable.Store(true)
 	logger.Info("Database connection established")
 	return nil
+}
+
+// retryDatabaseInit re-attempts the initial connection with bounded
+// exponential backoff. After maxDatabaseRetries the service stays degraded
+// (DB handlers keep returning Unavailable) until the process is restarted.
+func retryDatabaseInit() {
+	backoff := baseRetryBackoff
+	for attempt := 1; attempt <= maxDatabaseRetries; attempt++ {
+		time.Sleep(backoff)
+		logger.Warn(fmt.Sprintf("Retrying database connection (attempt %d/%d)", attempt, maxDatabaseRetries))
+		if err := initDatabase(); err != nil {
+			logger.Warn("Database retry failed", slog.String("reason", sanitizeDBError(err)))
+		} else {
+			logger.Info(fmt.Sprintf("Database connection established on retry attempt %d", attempt))
+			return
+		}
+		backoff *= 2
+		if backoff > maxRetryBackoff {
+			backoff = maxRetryBackoff
+		}
+	}
+	logger.Warn("Database retry budget exhausted; remaining DEGRADED until restart (DB handlers return Unavailable)")
 }
 
 func main() {
 	ctx := context.Background()
 
-	// Initialize database connection
+	// Initialize database connection (fail-OPEN: a DB outage degrades the
+	// service instead of crash-looping the process).
 	if err := initDatabase(); err != nil {
-		logger.Error(fmt.Sprintf("Error initializing database: %v", err))
-		os.Exit(1)
+		logger.Warn("Database unavailable at startup; starting in DEGRADED mode (DB handlers will return Unavailable)",
+			slog.String("reason", sanitizeDBError(err)))
+		go retryDatabaseInit()
 	}
 	defer func() {
 		if db != nil {
@@ -110,6 +170,7 @@ func main() {
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
 	if err != nil {
 		logger.Error(fmt.Sprintf("TCP Listen: %v", err))
+		os.Exit(1)
 	}
 
 	srv := grpc.NewServer()
@@ -271,10 +332,22 @@ func parseProductRow(id, name, description, picture, currencyCode, categoriesStr
 
 func mustMapEnv(target *string, key string) {
 	value, present := os.LookupEnv(key)
-	if !present {
+	if !present || value == "" {
 		logger.Error(fmt.Sprintf("Environment Variable Not Set: %q", key))
+		os.Exit(1)
 	}
 	*target = value
+}
+
+// dbReady reports whether the service can serve DB-backed requests.
+func dbReady() bool {
+	return dbAvailable.Load() && db != nil
+}
+
+// dbUnavailableError maps a DB failure to gRPC Unavailable: degraded reads
+// fail loudly instead of returning fake empty success.
+func dbUnavailableError(err error) error {
+	return status.Errorf(codes.Unavailable, "database unavailable: %s", sanitizeDBError(err))
 }
 
 func (p *productCatalog) Check(ctx context.Context, req *healthpb.HealthCheckRequest) (*healthpb.HealthCheckResponse, error) {
@@ -288,6 +361,9 @@ func (p *productCatalog) Watch(req *healthpb.HealthCheckRequest, ws healthpb.Hea
 func (p *productCatalog) ListProducts(ctx context.Context, req *pb.Empty) (*pb.ListProductsResponse, error) {
 	products, err := loadProductsFromDB(ctx)
 	if err != nil {
+		if !dbReady() {
+			return nil, dbUnavailableError(err)
+		}
 		return nil, status.Errorf(codes.Internal, "failed to load products: %v", err)
 	}
 
@@ -295,6 +371,10 @@ func (p *productCatalog) ListProducts(ctx context.Context, req *pb.Empty) (*pb.L
 }
 
 func (p *productCatalog) GetProduct(ctx context.Context, req *pb.GetProductRequest) (*pb.Product, error) {
+	if !dbReady() {
+		return nil, dbUnavailableError(fmt.Errorf("database connection not initialized"))
+	}
+
 	// GetProduct will fail on a specific product when feature flag is enabled
 	if p.checkProductFailure(ctx, req.Id) {
 		msg := "Error: Product Catalog Fail Feature Flag Enabled"
@@ -303,6 +383,9 @@ func (p *productCatalog) GetProduct(ctx context.Context, req *pb.GetProductReque
 
 	found, err := getProductFromDB(ctx, req.Id)
 	if err != nil {
+		if !dbReady() {
+			return nil, dbUnavailableError(err)
+		}
 		msg := fmt.Sprintf("Product Not Found: %s", req.Id)
 		return nil, status.Error(codes.NotFound, msg)
 	}
@@ -320,6 +403,9 @@ func (p *productCatalog) GetProduct(ctx context.Context, req *pb.GetProductReque
 func (p *productCatalog) SearchProducts(ctx context.Context, req *pb.SearchProductsRequest) (*pb.SearchProductsResponse, error) {
 	result, err := searchProductsFromDB(ctx, req.Query)
 	if err != nil {
+		if !dbReady() {
+			return nil, dbUnavailableError(err)
+		}
 		return nil, status.Errorf(codes.Internal, "failed to search products: %v", err)
 	}
 
@@ -352,6 +438,9 @@ func triggerLockContentionLoop(ctx context.Context) {
 }
 
 func triggerLockContention(ctx context.Context) {
+	if !dbReady() {
+		return
+	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		logger.Error("failed to begin lock contention transaction", slog.Any("error", err))
