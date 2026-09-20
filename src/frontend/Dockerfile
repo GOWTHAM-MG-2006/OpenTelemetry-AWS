@@ -53,9 +53,7 @@ COPY --from=deps /app/node_modules/ node_modules/
 
 COPY ./src/frontend/public/ public/
 
-COPY ./src/frontend/utils/telemetry/Instrumentation.js Instrumentation.js
-
 ARG FRONTEND_PORT=8080
 EXPOSE ${FRONTEND_PORT}
 
-CMD ["--require=./Instrumentation.js", "server.js"]
+CMD ["server.js"]
