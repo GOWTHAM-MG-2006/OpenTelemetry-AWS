@@ -1,0 +1,256 @@
+# OmniWatch AWS browse slice — stripped compose (ADDITIVE file).
+#
+# Plan: E:\Project-OmniWatch\.omo\plans\opentelemetry-aws.md todo 10.
+# NEVER edit vendor compose.vendor.yaml / .env.vendor — they are read-only reference.
+#
+# Slice members (exactly 7): frontend, product-catalog, recommendation,
+# currency, cart, valkey, flagd. No collector, no observability stack,
+# no Lane-A/C or demo-only services.
+#
+# Build contexts mirror the vendor file (context "." = this slice root, so
+# COPY ./src/... and ./pb/... resolve identically) — same context as the
+# todo-4 baseline builds used, therefore the same image content.
+#
+# Image pins (convention :aws-<YYYY-MM-DD>, recorded 2026-09-20, never :latest,
+# never pushed anywhere — todo 13 pulls/transfers, todo 11 boots locally):
+#   omniwatch-aws-frontend:aws-2026-09-20
+#   omniwatch-aws-product-catalog:aws-2026-09-20
+#   omniwatch-aws-recommendation:aws-2026-09-20
+#   omniwatch-aws-currency:aws-2026-09-20
+#   omniwatch-aws-cart:aws-2026-09-20
+#   ghcr.io/open-feature/flagd:v0.16.0            (vendor .env.vendor FLAGD_IMAGE)
+#   ghcr.io/valkey-io/valkey:9.1.2-alpine3.24    (vendor .env.vendor VALKEY_IMAGE)
+#
+# Memory budget (1 GiB = 1024M box ceiling, per review):
+#   frontend 250M + catalog 20M + recommendation 150M + currency 20M
+#   + cart 160M + flagd 75M + valkey 20M (vendor value kept) = 695M total,
+#   headroom 329M. RSS gate (<800MB measured) owned by todo 11.
+#
+# Port findings (read from Dockerfiles, never assumed):
+#   frontend 8080, catalog 3550, recommendation 9001, currency 7001.
+#   cart: Dockerfile ARG/EXPOSE is 7070 AND cart Program.cs listens on
+#   ASPNETCORE_URLS=http://*:${CART_PORT} — no :8080 hardcode exists anywhere
+#   in src/cart, so cart serves gRPC on 7070; wired 7070:7070.
+#
+# Telemetry-strip notes: zero instrumentation env vars, zero collector
+# dependencies, no dead config-file volume on product-catalog.
+# DB_CONNECTION_STRING is env-only (Railway URL injected at deploy, never
+# committed). VALKEY_ADDR points at the box-local valkey service.
+# flagd keeps the vendor mount ./src/flagd:/etc/flagd with the same
+# file:./etc/flagd/demo.flagd.json URI. flagd has NO healthcheck: the
+# flagd:v0.16.0 image is shell-less (proven: `sh` not found in $PATH), so no
+# in-container probe can run; dependents use service_started.
+
+x-default-logging: &logging
+  driver: "json-file"
+  options:
+    max-size: "5m"
+    max-file: "2"
+
+networks:
+  default:
+    name: omniwatch-aws-slice
+    driver: bridge
+
+services:
+  frontend:
+    image: omniwatch-aws-frontend:aws-2026-09-20
+    container_name: aws-frontend
+    build:
+      context: .
+      dockerfile: ./src/frontend/Dockerfile
+    deploy:
+      resources:
+        limits:
+          memory: 250M
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-8080}:8080"
+    environment:
+      - PORT=8080
+      - FRONTEND_ADDR=frontend:8080
+      - CART_ADDR=cart:7070
+      - CURRENCY_ADDR=currency:7001
+      - PRODUCT_CATALOG_ADDR=product-catalog:3550
+      - RECOMMENDATION_ADDR=recommendation:9001
+      - FLAGD_HOST=flagd
+      - FLAGD_PORT=8013
+      - ENV_PLATFORM=aws-slice
+    healthcheck:
+      test: ["CMD", "/nodejs/bin/node", "-e", "require('net').connect(8080,require('os').hostname(),function(){process.exit(0)}).on('error',function(){process.exit(1)})"]
+      start_period: 60s
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      cart:
+        condition: service_started
+      currency:
+        condition: service_started
+      product-catalog:
+        condition: service_started
+      recommendation:
+        condition: service_started
+      flagd:
+        condition: service_started
+    logging: *logging
+
+  product-catalog:
+    image: omniwatch-aws-product-catalog:aws-2026-09-20
+    container_name: aws-product-catalog
+    build:
+      context: .
+      dockerfile: ./src/product-catalog/Dockerfile
+    deploy:
+      resources:
+        limits:
+          memory: 20M
+    restart: unless-stopped
+    ports:
+      - "${PRODUCT_CATALOG_PORT:-3550}:3550"
+    environment:
+      - PRODUCT_CATALOG_PORT=3550
+      - FLAGD_HOST=flagd
+      - FLAGD_PORT=8013
+      - GOMEMLIMIT=16MiB
+      - DB_CONNECTION_STRING=${DB_CONNECTION_STRING}
+    healthcheck:
+      test: ["CMD", "/bin/grpc_health_probe", "-addr=:3550"]
+      start_period: 10s
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    depends_on:
+      flagd:
+        condition: service_started
+    read_only: true
+    tmpfs:
+      - /tmp
+    logging: *logging
+
+  recommendation:
+    image: omniwatch-aws-recommendation:aws-2026-09-20
+    container_name: aws-recommendation
+    build:
+      context: .
+      dockerfile: ./src/recommendation/Dockerfile
+    deploy:
+      resources:
+        limits:
+          memory: 150M
+    restart: unless-stopped
+    ports:
+      - "${RECOMMENDATION_PORT:-9001}:9001"
+    environment:
+      - RECOMMENDATION_PORT=9001
+      - PRODUCT_CATALOG_ADDR=product-catalog:3550
+      - FLAGD_HOST=flagd
+      - FLAGD_PORT=8013
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9001"]
+      start_period: 10s
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    depends_on:
+      product-catalog:
+        condition: service_started
+      flagd:
+        condition: service_started
+    logging: *logging
+
+  currency:
+    image: omniwatch-aws-currency:aws-2026-09-20
+    container_name: aws-currency
+    build:
+      context: .
+      dockerfile: ./src/currency/Dockerfile
+    deploy:
+      resources:
+        limits:
+          memory: 20M
+    restart: unless-stopped
+    ports:
+      - "${CURRENCY_PORT:-7001}:7001"
+    environment:
+      - CURRENCY_PORT=7001
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 7001"]
+      start_period: 10s
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    logging: *logging
+
+  cart:
+    image: omniwatch-aws-cart:aws-2026-09-20
+    container_name: aws-cart
+    build:
+      context: .
+      dockerfile: ./src/cart/src/Dockerfile
+    deploy:
+      resources:
+        limits:
+          memory: 160M
+    restart: unless-stopped
+    ports:
+      - "${CART_PORT:-7070}:7070"
+    environment:
+      - CART_PORT=7070
+      - FLAGD_HOST=flagd
+      - FLAGD_PORT=8013
+      - VALKEY_ADDR=valkey:6379
+      - ASPNETCORE_URLS=http://*:7070
+    healthcheck:
+      test: ["CMD", "/bin/grpc_health_probe", "-addr=:7070"]
+      start_period: 10s
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    depends_on:
+      valkey:
+        condition: service_healthy
+      flagd:
+        condition: service_started
+    logging: *logging
+
+  valkey:
+    image: ghcr.io/valkey-io/valkey:9.1.2-alpine3.24
+    container_name: aws-valkey
+    user: valkey
+    deploy:
+      resources:
+        limits:
+          memory: 20M
+    restart: unless-stopped
+    ports:
+      - "${VALKEY_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli ping"]
+      start_period: 5s
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging: *logging
+
+  flagd:
+    image: ghcr.io/open-feature/flagd:v0.16.0
+    container_name: aws-flagd
+    deploy:
+      resources:
+        limits:
+          memory: 75M
+    restart: unless-stopped
+    environment:
+      - GOMEMLIMIT=60MiB
+    command: [
+      "start",
+      "--uri",
+      "file:./etc/flagd/demo.flagd.json"
+    ]
+    ports:
+      - "${FLAGD_PORT:-8013}:8013"
+      - "${FLAGD_OFREP_PORT:-8016}:8016"
+    volumes:
+      - ./src/flagd:/etc/flagd
+    logging: *logging
