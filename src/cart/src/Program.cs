@@ -19,15 +19,9 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging;
-using OpenTelemetry.Instrumentation.StackExchangeRedis;
-using OpenTelemetry.Logs;
-using OpenTelemetry.Metrics;
-using OpenTelemetry.Resources;
-using OpenTelemetry.Trace;
+
 using OpenFeature;
-using OpenFeature.Hooks;
 using OpenFeature.Providers.Flagd;
-using OpenTelemetry.OpAmp.Client;
 
 var builder = WebApplication.CreateBuilder(args);
 string valkeyAddress = builder.Configuration["VALKEY_ADDR"];
@@ -38,7 +32,6 @@ if (string.IsNullOrEmpty(valkeyAddress))
 }
 
 builder.Logging
-    .AddOpenTelemetry(options => options.AddOtlpExporter())
     .AddConsole();
 
 builder.Services.AddSingleton<ICartStore>(x =>
@@ -51,9 +44,7 @@ builder.Services.AddSingleton<ICartStore>(x =>
 builder.Services.AddOpenFeature(openFeatureBuilder =>
 {
     openFeatureBuilder
-        .AddProvider(_ => new FlagdProvider())
-        .AddHook<MetricsHook>()
-        .AddHook<TraceEnricherHook>();
+        .AddProvider(_ => new FlagdProvider());
 });
 
 builder.Services.AddSingleton(x =>
@@ -64,32 +55,6 @@ builder.Services.AddSingleton(x =>
 ));
 
 
-var serviceInstanceId = Guid.NewGuid().ToString();
-
-Action<ResourceBuilder> appResourceBuilder =
-    resource => resource
-        .AddService(builder.Environment.ApplicationName, serviceInstanceId: serviceInstanceId)
-        .AddContainerDetector()
-        .AddHostDetector();
-
-builder.Services.AddOpenTelemetry()
-    .ConfigureResource(appResourceBuilder)
-    .WithTracing(tracerBuilder => tracerBuilder
-        .AddSource("OpenTelemetry.Demo.Cart")
-        .AddRedisInstrumentation(
-            options => options.SetVerboseDatabaseStatements = true)
-        .AddAspNetCoreInstrumentation()
-        .AddGrpcClientInstrumentation()
-        .AddHttpClientInstrumentation()
-        .AddOtlpExporter())
-    .WithMetrics(meterBuilder => meterBuilder
-        .AddMeter("OpenTelemetry.Demo.Cart")
-        .AddMeter("OpenFeature")
-        .AddProcessInstrumentation()
-        .AddRuntimeInstrumentation()
-        .AddAspNetCoreInstrumentation()
-        .SetExemplarFilter(ExemplarFilterType.TraceBased)
-        .AddOtlpExporter());
 builder.Services.AddGrpc();
 builder.Services.AddSingleton<readinessCheck>();
 builder.Services.AddGrpcHealthChecks()
@@ -98,32 +63,6 @@ builder.Services.AddGrpcHealthChecks()
 builder.Services.AddSingleton<HealthServiceImpl>();
 
 var app = builder.Build();
-
-OpAmpClient opAmpClient = null;
-var opampEndpoint = builder.Configuration["OPAMP_SERVER_ENDPOINT"];
-var opampSkipTlsCertificateVerification =
-    builder.Configuration.GetValue<bool>("OPAMP_SERVER_TLS_INSECURE_SKIP_VERIFY");
-if (!string.IsNullOrEmpty(opampEndpoint))
-{
-    var opAmpLogger = app.Services.GetRequiredService<ILogger<Program>>();
-    try
-    {
-        var opAmpResourceBuilder = ResourceBuilder.CreateDefault();
-        appResourceBuilder(opAmpResourceBuilder);
-        opAmpClient = await OpAmpClientSetup.StartAsync(
-            opampEndpoint,
-            opAmpResourceBuilder.Build(),
-            opampSkipTlsCertificateVerification);
-    }
-    catch (Exception ex)
-    {
-        opAmpLogger.LogWarning(ex, "Failed to start OpAMP client");
-        opAmpClient = null;
-    }
-}
-
-var ValkeyCartStore = (ValkeyCartStore)app.Services.GetRequiredService<ICartStore>();
-app.Services.GetRequiredService<StackExchangeRedisInstrumentation>().AddConnection(ValkeyCartStore.GetConnection());
 
 app.MapGrpcService<CartService>();
 app.MapGrpcService<HealthServiceImpl>();
@@ -134,9 +73,3 @@ app.MapGet("/", async context =>
 });
 
 app.Run();
-
-if (opAmpClient != null)
-{
-    await opAmpClient.StopAsync();
-    opAmpClient.Dispose();
-}
