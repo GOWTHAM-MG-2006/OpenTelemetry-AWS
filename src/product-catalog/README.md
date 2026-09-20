@@ -23,26 +23,17 @@ From the root directory, run:
 docker compose build product-catalog
 ```
 
-Database Calls Instrumentation
+Database Calls
 
-PostgreSQL queries are instrumented with
-[otelsql](https://pkg.go.dev/github.com/XSAM/otelsql), with SQLCommenter enabled
-to append trace context to SQL statements (for example, `traceparent` key-value
-pairs in query comments).
-
-The option is configured in `main.go` when opening the database connection:
+PostgreSQL queries use plain `database/sql` with the `lib/pq` driver.
+The connection is opened in `main.go` via:
 
 ```go
-db, err = otelsql.Open("postgres", connStr,
-    dbAttrs,
-    otelsql.WithSQLCommenter(true),
-    otelsql.WithSpanOptions(...),
-)
+db, err = sql.Open("postgres", connStr)
 ```
 
-Queries must use context-aware methods such as `QueryContext` and
-`QueryRowContext` so the active trace context is available when SQL comments
-are injected.
+Queries use context-aware methods such as `QueryContext` and
+`QueryRowContext`.
 
 ## Regenerate protos
 
