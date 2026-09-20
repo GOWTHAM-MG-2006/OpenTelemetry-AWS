@@ -1,0 +1,17 @@
+# Additive agent overlay: `docker compose -f compose.aws.yaml -f compose.agent.yaml up -d omniwatch-agent`
+# Never merged into compose.aws.yaml; slice services untouched.
+# Preserved from EC2 box (~/aws-slice/compose.agent.yaml); volume path
+# relativized to ./config/agent.vm.yaml to match this repo layout.
+services:
+  omniwatch-agent:
+    image: omniwatch-agent:aws-vm
+    command: ["--config", "/etc/omniwatch/agent.yaml"]
+    ports:
+      - "8081:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./config/agent.vm.yaml:/etc/omniwatch/agent.yaml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    restart: unless-stopped
+    mem_limit: 128m

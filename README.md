@@ -63,6 +63,22 @@ runtime). `src/postgresql` is copied whole (includes `init.sql` + Dockerfile).
 empty `API_KEY=`) — no real secrets. Real credentials come later via
 Railway/env, never committed.
 
+## Observer layer (box-preserved configs)
+
+The running EC2 observer configs are preserved here: `compose.agent.yaml`
+(additive overlay — never merged into `compose.aws.yaml`) mounts
+`config/agent.vm.yaml` (agent VM-mode: no kubelet, emptied k8s lists, OTLP
+export to `host.docker.internal:4317`) into `omniwatch-agent:aws-vm`, and
+`config/otelcol-aws.yaml` is the box collector config (OTLP gRPC on 4317 →
+batch → debug; on the box it runs as `otel/opentelemetry-collector-contrib:0.130.0`
+with `/tmp/otelcol-aws.yaml` bound to `/etc/otelcol.yaml`). Bring the
+observer layer up with `docker compose -f compose.aws.yaml -f
+compose.agent.yaml up -d omniwatch-agent` (agent health on `:8081`). The box
+`.env.aws` was reviewed and deliberately excluded: it equals
+`.env.aws.example` except for the live Railway `DB_CONNECTION_STRING`, which
+is never committed — copy `.env.aws.example` to `.env.aws` and inject the
+real URL at deploy time.
+
 ## Plan pointer
 
 Build plan: `E:\Project-OmniWatch\.omo\plans\opentelemetry-aws.md`

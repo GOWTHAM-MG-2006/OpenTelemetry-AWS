@@ -1,0 +1,73 @@
+# OmniWatch agent VM-mode config for AWS slice (EC2, no kubelet, no Tailscale)
+# Probe-derived: agent never dials the K8s API (collector emits OTel-SDK
+# heartbeats only), so k8s lists are emptied per plan and receivers degrade
+# trivially. Config-only change; no agent code touched.
+agent:
+  collection_interval: 15s
+  log_level: info
+  health_addr: ":8080"
+  shutdown_timeout: 10s
+  health_read_timeout: 5s
+  health_write_timeout: 5s
+  export_init_timeout: 10s
+  heartbeat_emit_timeout: 10s
+receiver:
+  hostmetrics:
+    collection_interval: 60s
+  filelog:
+    include:
+      - /var/lib/docker/containers/*/*.log
+    exclude:
+      - /var/lib/docker/containers/*/*.gz
+    start_at: beginning
+    operators:
+      - type: json_parser
+        timestamp:
+          parse_from: attributes.time
+          layout: RFC3339
+        severity:
+          parse_from: attributes.level
+  k8s_objects:
+    collection_interval: 3m
+    mode: pull
+    label_selector: ""
+    field_selector: ""
+    objects: []
+  k8s_cluster:
+    collection_interval: 3m
+    node_conditions_to_report: []
+exporter:
+  otlp:
+    endpoint: host.docker.internal:4317
+    insecure: true
+    metric_export_interval: 10s
+auth:
+  mode: dev
+  trusted_ca_file: ""
+resilience:
+  circuit_breaker_threshold: 5
+  circuit_breaker_timeout: 30s
+  breaker_interval: 30s
+  breaker_max_half_open_probes: 1
+  queue_size: 1000
+  retry_max_attempts: 3
+  retry_base_delay: 100ms
+  retry_backoffs:
+    - 100ms
+    - 500ms
+    - 2s
+  retry_max_delay: 2s
+  retry_jitter_fraction: 0.5
+alerting:
+  rules_path: /etc/omniwatch/alerts/prometheusrules.yaml
+  scrape_interval: 30s
+  for_default: 0s
+  slo_health: 99.9
+  slo_export: 99.0
+  slo_latency_p99: 5
+beyla:
+  otlp_endpoint: ""
+  log_level: INFO
+  discovery_ports: "80,443,8000-8999"
+  exclude_namespaces: kube-system
+  wakeup_len: 100
